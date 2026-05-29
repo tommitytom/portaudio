@@ -43,6 +43,7 @@
 #include "pa_hostapi.h"
 
 PaError PaJack_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiIndex index );
+PaError PaPipeWire_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiIndex index );
 PaError PaPulseAudio_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiIndex index );
 PaError PaAlsa_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiIndex index );
 PaError PaSndio_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiIndex index );
@@ -102,6 +103,10 @@ PaUtilHostApiInitializer *paHostApiInitializers[] =
 
 #if PA_USE_COREAUDIO
         PaMacCore_Initialize,
+#endif
+
+#if PA_USE_PIPEWIRE
+        PaPipeWire_Initialize,
 #endif
 
 #if PA_USE_PULSEAUDIO
