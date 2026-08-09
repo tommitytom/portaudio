@@ -150,8 +150,18 @@ set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/
 # if the FindJACK.cmake module finds POSIX headers.
 find_package(JACK)
 cmake_dependent_option(PA_USE_JACK "Enable support for JACK Audio Connection Kit" ON JACK_FOUND OFF)
+option(PA_JACK_DYNAMIC "Load libjack at runtime with dlopen instead of linking it (binary launches without libjack.so.0)" OFF)
 if(PA_USE_JACK)
-  target_link_libraries(portaudio PRIVATE JACK::jack)
+  if(PA_JACK_DYNAMIC)
+    # Compile the backend (it still needs the JACK headers) but do NOT link libjack — pa_jack.c dlopens
+    # it on first use, so the binary launches even where libjack.so.0 is absent. Keep Regex::regex (port
+    # matching, part of libc on Linux) + dl. See the PA_JACK_DYNAMIC block in pa_jack.c.
+    target_include_directories(portaudio PRIVATE ${JACK_INCLUDE_DIRS} ${JACK_INCLUDEDIR})
+    target_link_libraries(portaudio PRIVATE Regex::regex ${CMAKE_DL_LIBS})
+    target_compile_definitions(portaudio PRIVATE PA_JACK_DYNAMIC)
+  else()
+    target_link_libraries(portaudio PRIVATE JACK::jack)
+  endif()
   target_sources(portaudio PRIVATE
     src/hostapi/jack/pa_jack.c
     src/os/unix/pa_pthread_util.c
@@ -405,12 +415,19 @@ elseif(UNIX)
 
     pkg_check_modules(PIPEWIRE libpipewire-0.3>=0.3.0)
     cmake_dependent_option(PA_USE_PIPEWIRE "Enable support for PipeWire" ON PIPEWIRE_FOUND OFF)
+    option(PA_PIPEWIRE_DYNAMIC "Load libpipewire at runtime with dlopen instead of linking it (binary launches without libpipewire-0.3.so.0)" OFF)
     if(PA_USE_PIPEWIRE)
-      target_link_libraries(portaudio PRIVATE ${PIPEWIRE_LIBRARIES})
       target_include_directories(portaudio PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
       target_sources(portaudio PRIVATE src/hostapi/pipewire/pa_linux_pipewire.c)
       target_compile_definitions(portaudio PUBLIC PA_USE_PIPEWIRE=1)
       target_compile_options(portaudio PRIVATE ${PIPEWIRE_CFLAGS_OTHER})
+      if(PA_PIPEWIRE_DYNAMIC)
+        # dlopen libpipewire at runtime (headers still needed to compile). Binary launches without it.
+        target_link_libraries(portaudio PRIVATE ${CMAKE_DL_LIBS})
+        target_compile_definitions(portaudio PRIVATE PA_PIPEWIRE_DYNAMIC)
+      else()
+        target_link_libraries(portaudio PRIVATE ${PIPEWIRE_LIBRARIES})
+      endif()
       set(PKGCONFIG_CFLAGS "${PKGCONFIG_CFLAGS} -DPA_USE_PIPEWIRE=1")
       set(PKGCONFIG_REQUIRES_PRIVATE "${PKGCONFIG_REQUIRES_PRIVATE} libpipewire-0.3")
     endif()

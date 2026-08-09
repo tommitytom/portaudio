@@ -59,6 +59,89 @@
 #include "pa_ringbuffer.h"
 #include "pa_debugprint.h"
 
+/* -------------------------------------------------------------------------------------------------
+ * Optional runtime loading of libpipewire (PA_PIPEWIRE_DYNAMIC). When enabled, the backend is
+ * compiled but libpipewire-0.3 is NOT linked; it is dlopen'd on first use so a binary that ships the
+ * PipeWire host API still launches on a machine without libpipewire-0.3.so.0 (PaPipeWire_Initialize
+ * then soft-fails and Pa_Initialize omits the PipeWire host API). Mirrors the ALSA PA_ALSA_DYNAMIC
+ * pattern. NOTE: only the real EXPORTED pw_* functions are loaded; pw_core_add_listener /
+ * pw_core_get_registry / pw_core_sync / pw_registry_add_listener are header-only macros (they call
+ * spa interface methods on the proxies) and need no dlsym.
+ * ------------------------------------------------------------------------------------------------- */
+#ifdef PA_PIPEWIRE_DYNAMIC
+#include <dlfcn.h>
+
+#define PA_PW_FUNCS(_) \
+    _(pw_init) _(pw_deinit) _(pw_context_new) _(pw_context_connect) _(pw_context_destroy) \
+    _(pw_core_disconnect) _(pw_proxy_destroy) _(pw_properties_new) _(pw_properties_set) \
+    _(pw_stream_new) _(pw_stream_add_listener) _(pw_stream_connect) _(pw_stream_disconnect) \
+    _(pw_stream_destroy) _(pw_stream_dequeue_buffer) _(pw_stream_queue_buffer) _(pw_stream_get_time_n) \
+    _(pw_thread_loop_new) _(pw_thread_loop_destroy) _(pw_thread_loop_get_loop) _(pw_thread_loop_start) \
+    _(pw_thread_loop_stop) _(pw_thread_loop_lock) _(pw_thread_loop_unlock) _(pw_thread_loop_signal) \
+    _(pw_thread_loop_wait)
+
+/* A function pointer per call, typed off the real prototype (pipewire.h included above). Declared
+ * BEFORE the redirect #defines so __typeof__ sees the real symbols. */
+#define PA_PW_DECL(name) static __typeof__(name) *pa_dyn_##name = NULL;
+PA_PW_FUNCS(PA_PW_DECL)
+#undef PA_PW_DECL
+
+static void *g_pwLib = NULL;
+
+static int PaPipeWire_LoadLibrary( void )
+{
+    const char *soname = getenv( "PA_PIPEWIRE_SONAME" );
+    if( !soname || !*soname ) soname = "libpipewire-0.3.so.0";
+    if( g_pwLib ) return 1;
+    dlerror();
+    g_pwLib = dlopen( soname, RTLD_NOW | RTLD_GLOBAL );
+    if( !g_pwLib ) return 0;
+#define PA_PW_LOAD(name) \
+    *(void **)( &pa_dyn_##name ) = dlsym( g_pwLib, #name ); \
+    if( !pa_dyn_##name ) { dlclose( g_pwLib ); g_pwLib = NULL; return 0; }
+    PA_PW_FUNCS(PA_PW_LOAD)
+#undef PA_PW_LOAD
+    return 1;
+}
+
+static void PaPipeWire_UnloadLibrary( void )
+{
+    if( g_pwLib ) { dlclose( g_pwLib ); g_pwLib = NULL; }
+}
+
+/* Redirect every call site to its pointer (must come AFTER the __typeof__ declarations above). The
+ * four header macros above are intentionally NOT redirected. */
+#define pw_init                  pa_dyn_pw_init
+#define pw_deinit                pa_dyn_pw_deinit
+#define pw_context_new           pa_dyn_pw_context_new
+#define pw_context_connect       pa_dyn_pw_context_connect
+#define pw_context_destroy       pa_dyn_pw_context_destroy
+#define pw_core_disconnect       pa_dyn_pw_core_disconnect
+#define pw_proxy_destroy         pa_dyn_pw_proxy_destroy
+#define pw_properties_new        pa_dyn_pw_properties_new
+#define pw_properties_set        pa_dyn_pw_properties_set
+#define pw_stream_new            pa_dyn_pw_stream_new
+#define pw_stream_add_listener   pa_dyn_pw_stream_add_listener
+#define pw_stream_connect        pa_dyn_pw_stream_connect
+#define pw_stream_disconnect     pa_dyn_pw_stream_disconnect
+#define pw_stream_destroy        pa_dyn_pw_stream_destroy
+#define pw_stream_dequeue_buffer pa_dyn_pw_stream_dequeue_buffer
+#define pw_stream_queue_buffer   pa_dyn_pw_stream_queue_buffer
+#define pw_stream_get_time_n     pa_dyn_pw_stream_get_time_n
+#define pw_thread_loop_new       pa_dyn_pw_thread_loop_new
+#define pw_thread_loop_destroy   pa_dyn_pw_thread_loop_destroy
+#define pw_thread_loop_get_loop  pa_dyn_pw_thread_loop_get_loop
+#define pw_thread_loop_start     pa_dyn_pw_thread_loop_start
+#define pw_thread_loop_stop      pa_dyn_pw_thread_loop_stop
+#define pw_thread_loop_lock      pa_dyn_pw_thread_loop_lock
+#define pw_thread_loop_unlock    pa_dyn_pw_thread_loop_unlock
+#define pw_thread_loop_signal    pa_dyn_pw_thread_loop_signal
+#define pw_thread_loop_wait      pa_dyn_pw_thread_loop_wait
+#else
+static int  PaPipeWire_LoadLibrary( void ) { return 1; }  /* libpipewire is linked; nothing to load */
+static void PaPipeWire_UnloadLibrary( void ) {}
+#endif /* PA_PIPEWIRE_DYNAMIC */
+
 
 /* Default latency values in seconds */
 #define PA_PIPEWIRE_DEFAULT_LOW_LATENCY     0.01
@@ -608,6 +691,14 @@ PaError PaPipeWire_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiI
     int highestInputPriority = -1;
     int highestOutputPriority = -1;
 
+    /* libpipewire absent (PA_PIPEWIRE_DYNAMIC): leave *hostApi NULL and return paNoError so
+     * Pa_Initialize skips the PipeWire host API instead of aborting all audio. No-op when linked. */
+    if( !PaPipeWire_LoadLibrary() )
+    {
+        *hostApi = NULL;
+        return paNoError;
+    }
+
     pw_init( NULL, NULL );
 
     pwHostApi = (PaPipeWireHostApiRepresentation *)PaUtil_AllocateZeroInitializedMemory(
@@ -901,6 +992,8 @@ static void Terminate( struct PaUtilHostApiRepresentation *hostApi )
     pw_deinit();
 
     PaUtil_FreeMemory( pwHostApi );
+
+    PaPipeWire_UnloadLibrary();  /* no-op unless PA_PIPEWIRE_DYNAMIC */
 }
 
 

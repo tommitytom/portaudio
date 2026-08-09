@@ -74,6 +74,85 @@
 
 #include "pa_jack.h"
 
+/* -------------------------------------------------------------------------------------------------
+ * Optional runtime loading of libjack (PA_JACK_DYNAMIC). When enabled, the backend is compiled but
+ * libjack is NOT linked; it is dlopen'd on first use so a binary that ships the JACK host API still
+ * launches on a machine without libjack.so.0 installed (PaJack_Initialize then soft-fails and
+ * Pa_Initialize just omits the JACK host API). Mirrors the ALSA PA_ALSA_DYNAMIC pattern.
+ * ------------------------------------------------------------------------------------------------- */
+#ifdef PA_JACK_DYNAMIC
+#include <dlfcn.h>
+
+/* Every libjack function the backend calls. */
+#define PA_JACK_FUNCS(_) \
+    _(jack_activate) _(jack_client_close) _(jack_client_name_size) _(jack_client_open) \
+    _(jack_connect) _(jack_deactivate) _(jack_frame_time) _(jack_get_buffer_size) \
+    _(jack_get_client_name) _(jack_get_ports) _(jack_get_sample_rate) _(jack_on_shutdown) \
+    _(jack_port_by_name) _(jack_port_connected) _(jack_port_disconnect) _(jack_port_get_buffer) \
+    _(jack_port_get_latency_range) _(jack_port_name) _(jack_port_name_size) _(jack_port_register) \
+    _(jack_port_unregister) _(jack_set_error_function) _(jack_set_process_callback) \
+    _(jack_set_sample_rate_callback) _(jack_set_xrun_callback)
+
+/* A function pointer per call, typed off the real prototype (jack.h is included above). Declared
+ * BEFORE the redirect #defines below so __typeof__ sees the real symbol. */
+#define PA_JACK_DECL(name) static __typeof__(name) *pa_dyn_##name = NULL;
+PA_JACK_FUNCS(PA_JACK_DECL)
+#undef PA_JACK_DECL
+
+static void *g_jackLib = NULL;
+
+static int PaJack_LoadLibrary( void )
+{
+    const char *soname = getenv( "PA_JACK_SONAME" );
+    if( !soname || !*soname ) soname = "libjack.so.0";
+    if( g_jackLib ) return 1;
+    dlerror();
+    g_jackLib = dlopen( soname, RTLD_NOW | RTLD_GLOBAL );
+    if( !g_jackLib ) return 0;
+#define PA_JACK_LOAD(name) \
+    *(void **)( &pa_dyn_##name ) = dlsym( g_jackLib, #name ); \
+    if( !pa_dyn_##name ) { dlclose( g_jackLib ); g_jackLib = NULL; return 0; }
+    PA_JACK_FUNCS(PA_JACK_LOAD)
+#undef PA_JACK_LOAD
+    return 1;
+}
+
+static void PaJack_UnloadLibrary( void )
+{
+    if( g_jackLib ) { dlclose( g_jackLib ); g_jackLib = NULL; }
+}
+
+/* Redirect every call site to its pointer (must come AFTER the __typeof__ declarations above). */
+#define jack_activate                 pa_dyn_jack_activate
+#define jack_client_close             pa_dyn_jack_client_close
+#define jack_client_name_size         pa_dyn_jack_client_name_size
+#define jack_client_open              pa_dyn_jack_client_open
+#define jack_connect                  pa_dyn_jack_connect
+#define jack_deactivate               pa_dyn_jack_deactivate
+#define jack_frame_time               pa_dyn_jack_frame_time
+#define jack_get_buffer_size          pa_dyn_jack_get_buffer_size
+#define jack_get_client_name          pa_dyn_jack_get_client_name
+#define jack_get_ports                pa_dyn_jack_get_ports
+#define jack_get_sample_rate          pa_dyn_jack_get_sample_rate
+#define jack_on_shutdown              pa_dyn_jack_on_shutdown
+#define jack_port_by_name             pa_dyn_jack_port_by_name
+#define jack_port_connected           pa_dyn_jack_port_connected
+#define jack_port_disconnect          pa_dyn_jack_port_disconnect
+#define jack_port_get_buffer          pa_dyn_jack_port_get_buffer
+#define jack_port_get_latency_range   pa_dyn_jack_port_get_latency_range
+#define jack_port_name                pa_dyn_jack_port_name
+#define jack_port_name_size           pa_dyn_jack_port_name_size
+#define jack_port_register            pa_dyn_jack_port_register
+#define jack_port_unregister          pa_dyn_jack_port_unregister
+#define jack_set_error_function       pa_dyn_jack_set_error_function
+#define jack_set_process_callback     pa_dyn_jack_set_process_callback
+#define jack_set_sample_rate_callback pa_dyn_jack_set_sample_rate_callback
+#define jack_set_xrun_callback        pa_dyn_jack_set_xrun_callback
+#else
+static int  PaJack_LoadLibrary( void ) { return 1; }  /* libjack is linked; nothing to load */
+static void PaJack_UnloadLibrary( void ) {}
+#endif /* PA_JACK_DYNAMIC */
+
 static pthread_t mainThread_;
 static char *jackErr_ = NULL;
 static const char* clientName_ = "PortAudio";
@@ -771,6 +850,11 @@ PaError PaJack_Initialize( PaUtilHostApiRepresentation **hostApi,
     *hostApi = NULL;    /* Initialize to NULL */
     pthread_condattr_t cattr;
 
+    /* libjack absent (PA_JACK_DYNAMIC): leave *hostApi NULL and return paNoError so Pa_Initialize
+     * skips the JACK host API instead of aborting all audio. No-op when libjack is linked. */
+    if( !PaJack_LoadLibrary() )
+        return paNoError;
+
     UNLESS( jackHostApi = (PaJackHostApiRepresentation*)
         PaUtil_AllocateZeroInitializedMemory( sizeof(PaJackHostApiRepresentation) ), paInsufficientMemory );
     UNLESS( jackHostApi->deviceInfoMemory = PaUtil_CreateAllocationGroup(), paInsufficientMemory );
@@ -893,6 +977,8 @@ static void Terminate( struct PaUtilHostApiRepresentation *hostApi )
 
     free( jackErr_ );
     jackErr_ = NULL;
+
+    PaJack_UnloadLibrary();  /* no-op unless PA_JACK_DYNAMIC */
 }
 
 static PaError IsFormatSupported( struct PaUtilHostApiRepresentation *hostApi,
