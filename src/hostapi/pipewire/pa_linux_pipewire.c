@@ -206,7 +206,8 @@ static signed long GetStreamWriteAvailable( PaStream* stream );
 typedef struct PaPipeWireDeviceInfo
 {
     uint32_t    nodeId;
-    char       *nodeName;
+    char       *nodeName;    /* display name (the node description, human-readable) */
+    char       *targetName;  /* PW_KEY_NODE_NAME — the stable name PW_KEY_TARGET_OBJECT matches on (routing) */
     int         isSource;   /* 1 = input/source, 0 = output/sink */
     int         priority;
     int         maxChannels;
@@ -260,6 +261,10 @@ typedef struct PaPipeWireStream
     double                       sampleRate;
     uint32_t                     inputNodeId;
     uint32_t                     outputNodeId;
+    /* node.name of the chosen device, for PW_KEY_TARGET_OBJECT routing. Points into the host API's
+     * enumDevices (valid for the host API's lifetime, which outlives the stream); NULL = autoconnect. */
+    const char                  *inputTargetName;
+    const char                  *outputTargetName;
 
     /* State */
     volatile sig_atomic_t        isActive;
@@ -360,6 +365,9 @@ static void OnRegistryGlobal( void *data, uint32_t id, uint32_t permissions,
         dev->nodeName = strdup( nodeName );
     else
         dev->nodeName = strdup( "Unknown PipeWire Device" );
+
+    /* The node.name is the key PW_KEY_TARGET_OBJECT resolves against for routing (the description isn't). */
+    dev->targetName = strdup( nodeName && nodeName[0] ? nodeName : "" );
 
     channelsStr = spa_dict_lookup( props, PW_KEY_AUDIO_CHANNELS );
     dev->maxChannels = channelsStr ? atoi( channelsStr ) : 2;
@@ -629,7 +637,8 @@ static PaError CreateAndConnectStream( PaPipeWireStream *stream,
                                         enum spa_direction direction,
                                         int channelCount,
                                         double sampleRate,
-                                        uint32_t targetNodeId )
+                                        uint32_t targetNodeId,
+                                        const char *targetName )
 {
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT( buffer, sizeof(buffer) );
@@ -644,7 +653,14 @@ static PaError CreateAndConnectStream( PaPipeWireStream *stream,
         PW_KEY_MEDIA_ROLE, "Music",
         NULL );
 
-    if( targetNodeId != SPA_ID_INVALID )
+    /* Route to the chosen device. PW_KEY_TARGET_OBJECT resolves by node.name / object.serial / object.path
+     * (NOT the global node id), so target by the captured node.name; the numeric id is only a last-resort
+     * fallback. Absent target = autoconnect to the session default sink. */
+    if( targetName && targetName[0] )
+    {
+        pw_properties_set( props, PW_KEY_TARGET_OBJECT, targetName );
+    }
+    else if( targetNodeId != SPA_ID_INVALID )
     {
         snprintf( targetStr, sizeof(targetStr), "%u", targetNodeId );
         pw_properties_set( props, PW_KEY_TARGET_OBJECT, targetStr );
@@ -981,6 +997,8 @@ static void Terminate( struct PaUtilHostApiRepresentation *hostApi )
     {
         if( pwHostApi->enumDevices[i].nodeName )
             free( pwHostApi->enumDevices[i].nodeName );
+        if( pwHostApi->enumDevices[i].targetName )
+            free( pwHostApi->enumDevices[i].targetName );
     }
 
     if( pwHostApi->allocations )
@@ -1157,13 +1175,19 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     {
         int devIdx = inputParameters->device;
         if( devIdx >= 0 && devIdx < pwHostApi->enumDeviceCount )
+        {
             stream->inputNodeId = pwHostApi->enumDevices[devIdx].nodeId;
+            stream->inputTargetName = pwHostApi->enumDevices[devIdx].targetName;
+        }
     }
     if( outputParameters )
     {
         int devIdx = outputParameters->device;
         if( devIdx >= 0 && devIdx < pwHostApi->enumDeviceCount )
+        {
             stream->outputNodeId = pwHostApi->enumDevices[devIdx].nodeId;
+            stream->outputTargetName = pwHostApi->enumDevices[devIdx].targetName;
+        }
     }
 
     if( streamCallback )
@@ -1315,7 +1339,7 @@ static PaError StartStream( PaStream *s )
         result = CreateAndConnectStream( stream, &stream->outputStream,
             &stream->outputListener, &outputStreamEvents,
             SPA_DIRECTION_OUTPUT, stream->outputChannelCount,
-            stream->sampleRate, stream->outputNodeId );
+            stream->sampleRate, stream->outputNodeId, stream->outputTargetName );
         if( result != paNoError )
         {
             pw_thread_loop_unlock( stream->hostApi->loop );
@@ -1328,7 +1352,7 @@ static PaError StartStream( PaStream *s )
         result = CreateAndConnectStream( stream, &stream->inputStream,
             &stream->inputListener, &inputStreamEvents,
             SPA_DIRECTION_INPUT, stream->inputChannelCount,
-            stream->sampleRate, stream->inputNodeId );
+            stream->sampleRate, stream->inputNodeId, stream->inputTargetName );
         if( result != paNoError )
         {
             pw_thread_loop_unlock( stream->hostApi->loop );
