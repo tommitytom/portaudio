@@ -47,6 +47,7 @@
 #include <signal.h>
 
 #include <pipewire/pipewire.h>
+#include <pipewire/extensions/metadata.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/props.h>
 
@@ -78,7 +79,7 @@
     _(pw_stream_destroy) _(pw_stream_dequeue_buffer) _(pw_stream_queue_buffer) _(pw_stream_get_time_n) \
     _(pw_thread_loop_new) _(pw_thread_loop_destroy) _(pw_thread_loop_get_loop) _(pw_thread_loop_start) \
     _(pw_thread_loop_stop) _(pw_thread_loop_lock) _(pw_thread_loop_unlock) _(pw_thread_loop_signal) \
-    _(pw_thread_loop_wait)
+    _(pw_thread_loop_wait) _(pw_thread_loop_timed_wait)
 
 /* A function pointer per call, typed off the real prototype (pipewire.h included above). Declared
  * BEFORE the redirect #defines so __typeof__ sees the real symbols. */
@@ -137,6 +138,7 @@ static void PaPipeWire_UnloadLibrary( void )
 #define pw_thread_loop_unlock    pa_dyn_pw_thread_loop_unlock
 #define pw_thread_loop_signal    pa_dyn_pw_thread_loop_signal
 #define pw_thread_loop_wait      pa_dyn_pw_thread_loop_wait
+#define pw_thread_loop_timed_wait pa_dyn_pw_thread_loop_timed_wait
 #else
 static int  PaPipeWire_LoadLibrary( void ) { return 1; }  /* libpipewire is linked; nothing to load */
 static void PaPipeWire_UnloadLibrary( void ) {}
@@ -152,6 +154,14 @@ static void PaPipeWire_UnloadLibrary( void ) {}
 
 /* Maximum number of devices we'll track during enumeration */
 #define PA_PIPEWIRE_MAX_DEVICES             256
+
+/* Longest node.name we keep for the session default device (they are short paths like
+ * "alsa_output.pci-0000_00_1f.3.analog-stereo") */
+#define PA_PIPEWIRE_MAX_NAME                256
+
+/* Give up waiting for the daemon after this many seconds rather than blocking startup forever on a
+ * wedged/half-connected server. On a timeout we just carry on with whatever was enumerated. */
+#define PA_PIPEWIRE_ENUM_TIMEOUT_SEC        2
 
 /* Ring buffer size for blocking mode (in frames at high latency) */
 #define PA_PIPEWIRE_RING_FRAMES_FACTOR      4
@@ -230,6 +240,14 @@ typedef struct
     struct pw_registry          *registry;
     struct spa_hook              coreListener;
     struct spa_hook              registryListener;
+
+    /* The session's "default" metadata object (what wpctl/pavucontrol set when you pick a default
+     * device). Bound during enumeration; its default.audio.sink/source name is what we prefer as the
+     * PortAudio default device. */
+    struct pw_proxy             *metadata;
+    struct spa_hook              metadataListener;
+    char                         defaultSinkName[PA_PIPEWIRE_MAX_NAME];
+    char                         defaultSourceName[PA_PIPEWIRE_MAX_NAME];
 
     /* Device enumeration state */
     PaPipeWireDeviceInfo         enumDevices[PA_PIPEWIRE_MAX_DEVICES];
@@ -312,6 +330,76 @@ static unsigned long RoundUpPow2( unsigned long v )
 }
 
 
+/* ---- Session default device (the "default" metadata object) ---- */
+
+/* Pull the node name out of a default.audio.sink/source metadata value. The value is JSON, in practice
+ * {"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"} — we only ever need that one string, so scan for
+ * it directly instead of dragging in a JSON parser (and its cross-version API churn). Older servers wrote
+ * the bare name with no JSON wrapper, which is handled by the no-brace fallback. */
+static void ExtractDefaultName( const char *value, char *out, size_t outSize )
+{
+    const char *p, *end;
+    size_t n;
+
+    out[0] = '\0';
+    if( !value )
+        return;   /* the key was cleared: no configured default */
+
+    p = strstr( value, "\"name\"" );
+    if( p )
+    {
+        p = strchr( p + 6, '"' );          /* opening quote of the value */
+        if( !p )
+            return;
+        ++p;
+        end = strchr( p, '"' );
+        if( !end )
+            return;
+    }
+    else if( strchr( value, '{' ) )
+    {
+        return;                            /* JSON, but no name field */
+    }
+    else
+    {
+        p = value;                         /* bare name */
+        end = value + strlen( value );
+    }
+
+    n = (size_t)( end - p );
+    if( n >= outSize )
+        n = outSize - 1;
+    memcpy( out, p, n );
+    out[n] = '\0';
+}
+
+static int OnMetadataProperty( void *data, uint32_t subject, const char *key,
+                               const char *type, const char *value )
+{
+    PaPipeWireHostApiRepresentation *pwHostApi = (PaPipeWireHostApiRepresentation *)data;
+
+    (void)type;
+
+    if( subject != PW_ID_CORE || !key )
+        return 0;
+
+    /* "default.audio.sink" is the user's current pick; "default.configured.audio.sink" is the sticky
+     * one they chose explicitly. The former follows the latter (and falls back to a live device when
+     * the configured one is unplugged), so it is the one to route by. */
+    if( strcmp( key, "default.audio.sink" ) == 0 )
+        ExtractDefaultName( value, pwHostApi->defaultSinkName, sizeof(pwHostApi->defaultSinkName) );
+    else if( strcmp( key, "default.audio.source" ) == 0 )
+        ExtractDefaultName( value, pwHostApi->defaultSourceName, sizeof(pwHostApi->defaultSourceName) );
+
+    return 0;
+}
+
+static const struct pw_metadata_events metadataEvents = {
+    PW_VERSION_METADATA_EVENTS,
+    .property = OnMetadataProperty,
+};
+
+
 /* ---- Registry events for device enumeration ---- */
 
 static void OnRegistryGlobal( void *data, uint32_t id, uint32_t permissions,
@@ -331,10 +419,30 @@ static void OnRegistryGlobal( void *data, uint32_t id, uint32_t permissions,
     (void)permissions;
     (void)version;
 
-    if( strcmp( type, PW_TYPE_INTERFACE_Node ) != 0 )
+    if( !props )
         return;
 
-    if( !props )
+    /* Bind the session's "default" metadata (there are other metadata objects, e.g. "route-settings")
+     * so its default.audio.sink/source properties reach OnMetadataProperty. */
+    if( strcmp( type, PW_TYPE_INTERFACE_Metadata ) == 0 )
+    {
+        const char *metaName = spa_dict_lookup( props, PW_KEY_METADATA_NAME );
+
+        if( !pwHostApi->metadata && metaName && strcmp( metaName, "default" ) == 0 )
+        {
+            pwHostApi->metadata = pw_registry_bind( pwHostApi->registry, id, type,
+                                                    PW_VERSION_METADATA, 0 );
+            if( pwHostApi->metadata )
+            {
+                spa_zero( pwHostApi->metadataListener );
+                pw_metadata_add_listener( pwHostApi->metadata, &pwHostApi->metadataListener,
+                                          &metadataEvents, pwHostApi );
+            }
+        }
+        return;
+    }
+
+    if( strcmp( type, PW_TYPE_INTERFACE_Node ) != 0 )
         return;
 
     mediaClass = spa_dict_lookup( props, PW_KEY_MEDIA_CLASS );
@@ -704,6 +812,8 @@ PaError PaPipeWire_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiI
     int i, deviceCount;
     int defaultInput = paNoDevice;
     int defaultOutput = paNoDevice;
+    int defaultInputByName = -1;    /* index of the session default source, if it was enumerated */
+    int defaultOutputByName = -1;   /* index of the session default sink, if it was enumerated */
     int highestInputPriority = -1;
     int highestOutputPriority = -1;
 
@@ -789,12 +899,27 @@ PaError PaPipeWire_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiI
     pw_registry_add_listener( pwHostApi->registry, &pwHostApi->registryListener,
                               &registryEvents, pwHostApi );
 
-    /* Sync and wait for device enumeration to complete */
-    pwHostApi->enumerationDone = 0;
-    pwHostApi->syncSeq = pw_core_sync( pwHostApi->core, PW_ID_CORE, 0 );
+    /* Round-trip the daemon: everything already in the registry is delivered before our sync comes back.
+     * Round two exists for the "default" metadata object, which we can only bind once round one has
+     * announced it — its properties (the session default sink/source) arrive during round two. Both
+     * rounds are time-boxed so a wedged daemon can't hang startup indefinitely. */
+    for( i = 0; i < 2; ++i )
+    {
+        pwHostApi->enumerationDone = 0;
+        pwHostApi->syncSeq = pw_core_sync( pwHostApi->core, PW_ID_CORE, 0 );
 
-    while( !pwHostApi->enumerationDone )
-        pw_thread_loop_wait( pwHostApi->loop );
+        while( !pwHostApi->enumerationDone )
+        {
+            if( pw_thread_loop_timed_wait( pwHostApi->loop, PA_PIPEWIRE_ENUM_TIMEOUT_SEC ) != 0 )
+            {
+                PA_DEBUG(( "PipeWire: timed out waiting for the daemon\n" ));
+                break;
+            }
+        }
+
+        if( !pwHostApi->metadata )
+            break;   /* no default metadata to collect, so one round is all there is */
+    }
 
     pw_thread_loop_unlock( pwHostApi->loop );
 
@@ -866,22 +991,46 @@ PaError PaPipeWire_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiI
             (*hostApi)->deviceInfos[i] = deviceInfo;
             ++(*hostApi)->info.deviceCount;
 
-            /* Track default devices by priority */
-            if( enumDev->isSource && enumDev->priority > highestInputPriority )
+            /* The default device is the session default (what the user picked in their desktop's sound
+             * settings) when we know it — matched on node.name, which is what the metadata stores.
+             * priority.session only decides it when there is no session default to honour: it ranks
+             * devices by kind (a headset outranks HDMI), which is a fine tiebreak but is NOT the user's
+             * choice, and picking by it alone lands playback on a device they aren't listening to. */
+            if( enumDev->isSource )
             {
-                highestInputPriority = enumDev->priority;
-                defaultInput = i;
+                if( defaultInputByName < 0 && pwHostApi->defaultSourceName[0] &&
+                    strcmp( enumDev->targetName, pwHostApi->defaultSourceName ) == 0 )
+                    defaultInputByName = i;
+
+                if( enumDev->priority > highestInputPriority )
+                {
+                    highestInputPriority = enumDev->priority;
+                    defaultInput = i;
+                }
             }
-            if( !enumDev->isSource && enumDev->priority > highestOutputPriority )
+            else
             {
-                highestOutputPriority = enumDev->priority;
-                defaultOutput = i;
+                if( defaultOutputByName < 0 && pwHostApi->defaultSinkName[0] &&
+                    strcmp( enumDev->targetName, pwHostApi->defaultSinkName ) == 0 )
+                    defaultOutputByName = i;
+
+                if( enumDev->priority > highestOutputPriority )
+                {
+                    highestOutputPriority = enumDev->priority;
+                    defaultOutput = i;
+                }
             }
         }
 
+        if( defaultInputByName >= 0 )
+            defaultInput = defaultInputByName;
+        if( defaultOutputByName >= 0 )
+            defaultOutput = defaultOutputByName;
+
         (*hostApi)->info.defaultInputDevice = defaultInput;
         (*hostApi)->info.defaultOutputDevice = defaultOutput;
-        PA_DEBUG(( "PipeWire defaults: input=%d output=%d\n", defaultInput, defaultOutput ));
+        PA_DEBUG(( "PipeWire defaults: input=%d output=%d (session default sink '%s', source '%s')\n",
+                   defaultInput, defaultOutput, pwHostApi->defaultSinkName, pwHostApi->defaultSourceName ));
     }
 
     (*hostApi)->Terminate = Terminate;
@@ -933,6 +1082,8 @@ error:
         if( pwHostApi->loop )
         {
             pw_thread_loop_lock( pwHostApi->loop );
+            if( pwHostApi->metadata )
+                pw_proxy_destroy( pwHostApi->metadata );
             if( pwHostApi->registry )
                 pw_proxy_destroy( (struct pw_proxy *)pwHostApi->registry );
             if( pwHostApi->core )
@@ -970,6 +1121,12 @@ static void Terminate( struct PaUtilHostApiRepresentation *hostApi )
     if( pwHostApi->loop )
     {
         pw_thread_loop_lock( pwHostApi->loop );
+
+        if( pwHostApi->metadata )
+        {
+            spa_hook_remove( &pwHostApi->metadataListener );
+            pw_proxy_destroy( pwHostApi->metadata );
+        }
 
         if( pwHostApi->registry )
         {
