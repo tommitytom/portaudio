@@ -771,6 +771,29 @@ static PaError CreateAndConnectStream( PaPipeWireStream *stream,
         PW_KEY_MEDIA_ROLE, "Music",
         NULL );
 
+    /* Declare the channel layout as PROPERTIES, not just in the format below. The adapter builds its port
+     * config from these; without them it takes its width from whatever it is being linked to, so a stream
+     * opened 8 wide against a stereo sink comes out with 2 ports and the extra channels are silently
+     * dropped rather than exposed for patching.
+     *
+     * Layout: FL/FR for the first pair, then AUX0.. for the rest. The leading stereo pair means a plain
+     * stereo sink still links pair 1 by position (the common case must not regress), and AUX marks the
+     * others as discrete sends rather than surround, so nothing routes pair 2 to a centre/LFE speaker.
+     * That is also what a Pro Audio profile interface exposes, which is where wide output is actually
+     * useful. */
+    snprintf( channelsStr, sizeof(channelsStr), "%d", channelCount );
+    pw_properties_set( props, PW_KEY_AUDIO_CHANNELS, channelsStr );
+
+    used = 0;
+    for( i = 0; i < channelCount && used < (int)sizeof(positionStr) - 8; ++i )
+    {
+        const char *sep = ( i == 0 ) ? "" : ",";
+        if( i == 0 )      used += snprintf( positionStr + used, sizeof(positionStr) - used, "FL" );
+        else if( i == 1 ) used += snprintf( positionStr + used, sizeof(positionStr) - used, "%sFR", sep );
+        else              used += snprintf( positionStr + used, sizeof(positionStr) - used, "%sAUX%d", sep, i - 2 );
+    }
+    if( channelCount > 0 )
+        pw_properties_set( props, SPA_KEY_AUDIO_POSITION, positionStr );  /* pipewire/keys.h has no PW_ alias */
 
     /* Route to the chosen device. PW_KEY_TARGET_OBJECT resolves by node.name / object.serial / object.path
      * (NOT the global node id), so target by the captured node.name; the numeric id is only a last-resort
@@ -800,6 +823,12 @@ static PaError CreateAndConnectStream( PaPipeWireStream *stream,
     rawInfo.format = SPA_AUDIO_FORMAT_F32;
     rawInfo.rate = (uint32_t)sampleRate;
     rawInfo.channels = (uint32_t)channelCount;
+    /* Same layout as the properties above, so the negotiated format and the port config agree. */
+    for( i = 0; i < channelCount && i < (int)SPA_AUDIO_MAX_CHANNELS; ++i )
+        rawInfo.position[i] = ( i == 0 ) ? SPA_AUDIO_CHANNEL_FL
+                            : ( i == 1 ) ? SPA_AUDIO_CHANNEL_FR
+                                         : (enum spa_audio_channel)( SPA_AUDIO_CHANNEL_AUX0 + ( i - 2 ) );
+
     params[0] = spa_format_audio_raw_build( &b, SPA_PARAM_EnumFormat, &rawInfo );
 
     return pw_stream_connect( *pwStream,
