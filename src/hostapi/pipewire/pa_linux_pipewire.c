@@ -163,6 +163,13 @@ static void PaPipeWire_UnloadLibrary( void ) {}
  * wedged/half-connected server. On a timeout we just carry on with whatever was enumerated. */
 #define PA_PIPEWIRE_ENUM_TIMEOUT_SEC        2
 
+/* The real ceiling on a playback stream's channel count. NOT the target sink's channel count: a PipeWire
+ * stream declares its own layout, and the sink does not constrain it — channels the sink can't take just
+ * stay unlinked until something patches them (a wider sink, a DAW, qpwgraph), exactly as under JACK. So a
+ * multi-channel app can open 8 output channels against a stereo sink and route the extra pairs elsewhere,
+ * which is the whole point of having them. */
+#define PA_PIPEWIRE_MAX_STREAM_CHANNELS     SPA_AUDIO_MAX_CHANNELS
+
 /* Ring buffer size for blocking mode (in frames at high latency) */
 #define PA_PIPEWIRE_RING_FRAMES_FACTOR      4
 
@@ -754,12 +761,16 @@ static PaError CreateAndConnectStream( PaPipeWireStream *stream,
     struct spa_audio_info_raw rawInfo;
     struct pw_properties *props;
     char targetStr[32];
+    char channelsStr[16];
+    char positionStr[8 * SPA_AUDIO_MAX_CHANNELS];
+    int i, used;
 
     props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, direction == SPA_DIRECTION_OUTPUT ? "Playback" : "Capture",
         PW_KEY_MEDIA_ROLE, "Music",
         NULL );
+
 
     /* Route to the chosen device. PW_KEY_TARGET_OBJECT resolves by node.name / object.serial / object.path
      * (NOT the global node id), so target by the captured node.name; the numeric id is only a last-resort
@@ -789,7 +800,6 @@ static PaError CreateAndConnectStream( PaPipeWireStream *stream,
     rawInfo.format = SPA_AUDIO_FORMAT_F32;
     rawInfo.rate = (uint32_t)sampleRate;
     rawInfo.channels = (uint32_t)channelCount;
-
     params[0] = spa_format_audio_raw_build( &b, SPA_PARAM_EnumFormat, &rawInfo );
 
     return pw_stream_connect( *pwStream,
@@ -1193,6 +1203,8 @@ static PaError IsFormatSupported( struct PaUtilHostApiRepresentation *hostApi,
         if( inputParameters->device == paUseHostApiSpecificDeviceSpecification )
             return paInvalidDevice;
 
+        /* Capture DOES bind to the source's width: channels the source doesn't have would only ever
+         * read silence, which no caller wants. Playback below is the asymmetric case. */
         if( inputChannelCount > hostApi->deviceInfos[inputParameters->device]->maxInputChannels )
             return paInvalidChannelCount;
 
@@ -1215,7 +1227,11 @@ static PaError IsFormatSupported( struct PaUtilHostApiRepresentation *hostApi,
         if( outputParameters->device == paUseHostApiSpecificDeviceSpecification )
             return paInvalidDevice;
 
-        if( outputChannelCount > hostApi->deviceInfos[outputParameters->device]->maxOutputChannels )
+        /* Bound by what a stream can carry, NOT by the sink's maxOutputChannels — see
+         * PA_PIPEWIRE_MAX_STREAM_CHANNELS. maxOutputChannels still reports the sink's own width, because
+         * that is a true description of the device; it just isn't a limit on what we can send. Keep this
+         * in step with OpenStream, so probing here can't promise something the open then refuses. */
+        if( outputChannelCount > PA_PIPEWIRE_MAX_STREAM_CHANNELS )
             return paInvalidChannelCount;
 
         if( outputParameters->hostApiSpecificStreamInfo )
@@ -1287,7 +1303,9 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
         if( outputParameters->device == paUseHostApiSpecificDeviceSpecification )
             return paInvalidDevice;
 
-        if( outputChannelCount > hostApi->deviceInfos[outputParameters->device]->maxOutputChannels )
+        /* Wider than the sink is legal here (PA_PIPEWIRE_MAX_STREAM_CHANNELS): the surplus channels
+         * become ports nothing is linked to yet, not an error. Mirrors IsFormatSupported. */
+        if( outputChannelCount > PA_PIPEWIRE_MAX_STREAM_CHANNELS )
             return paInvalidChannelCount;
 
         if( outputParameters->hostApiSpecificStreamInfo )
