@@ -752,9 +752,14 @@ PaError PaAlsa_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiIndex
     PaError result = paNoError;
     PaAlsaHostApiRepresentation *alsaHostApi = NULL;
 
-    /* Try loading Alsa library. */
+    /* Try loading Alsa library. If it isn't present (PA_ALSA_DYNAMIC), leave *hostApi NULL and return
+     * paNoError so Pa_Initialize skips the ALSA host API instead of aborting ALL audio (an error return
+     * hits `goto error → TerminateHostApis()` in pa_front.c). Matches the JACK/PipeWire soft-fail. */
     if (!PaAlsa_LoadLibrary())
-        return paHostApiNotFound;
+    {
+        *hostApi = NULL;
+        return paNoError;
+    }
 
     PA_UNLESS( alsaHostApi = (PaAlsaHostApiRepresentation*) PaUtil_AllocateZeroInitializedMemory(
                 sizeof(PaAlsaHostApiRepresentation) ), paInsufficientMemory );

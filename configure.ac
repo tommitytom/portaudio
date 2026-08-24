@@ -53,6 +53,10 @@ AC_ARG_WITH(pulseaudio,
             AS_HELP_STRING([--with-pulseaudio], [Enable support for PulseAudio @<:@autodetect@:>@]),
             [with_pulseaudio=$withval])
 
+AC_ARG_WITH(pipewire,
+            AS_HELP_STRING([--with-pipewire], [Enable support for PipeWire @<:@autodetect@:>@]),
+            [with_pipewire=$withval])
+
 AC_ARG_WITH(oss,
             AS_HELP_STRING([--with-oss], [Enable support for OSS @<:@autodetect@:>@]),
             [with_oss=$withval])
@@ -165,7 +169,7 @@ if test "x$with_oss" != "xno"; then
         AC_CHECK_LIB(ossaudio, _oss_ioctl, have_libossaudio=yes, have_libossaudio=no)
     fi
 fi
-if [[ "x$with_jack" != "xno" ] || [ "x$with_pulseaudio" != "xno" ]]; then
+if [[ "x$with_jack" != "xno" ] || [ "x$with_pulseaudio" != "xno" ] || [ "x$with_pipewire" != "xno" ]]; then
     PKG_PROG_PKG_CONFIG
 fi
 have_jack=no
@@ -175,6 +179,10 @@ fi
 have_pulse=no
 if test "x$with_pulseaudio" != "xno"; then
     PKG_CHECK_MODULES(PULSE, libpulse, have_pulse=yes, have_pulse=no)
+fi
+have_pipewire=no
+if test "x$with_pipewire" != "xno"; then
+    PKG_CHECK_MODULES(PIPEWIRE, libpipewire-0.3, have_pipewire=yes, have_pipewire=no)
 fi
 
 
@@ -396,8 +404,15 @@ case "${host_os}" in
            AC_DEFINE(PA_USE_JACK,1)
         fi
 
-        if [[ "$have_pulse" = "yes" ] || [ "$have_jack" = "yes" ]] ; then
+        if [[ "$have_pulse" = "yes" ] || [ "$have_jack" = "yes" ] || [ "$have_pipewire" = "yes" ]] ; then
            OTHER_OBJS="$OTHER_OBJS src/common/pa_ringbuffer.o"
+        fi
+
+        if [[ "$have_pipewire" = "yes" ] && [ "$with_pipewire" != "no" ]] ; then
+           DLL_LIBS="$DLL_LIBS $PIPEWIRE_LIBS"
+           CFLAGS="$CFLAGS $PIPEWIRE_CFLAGS"
+           OTHER_OBJS="$OTHER_OBJS src/hostapi/pipewire/pa_linux_pipewire.o"
+           AC_DEFINE(PA_USE_PIPEWIRE,1)
         fi
 
         if [[ "$have_pulse" = "yes" ] && [ "$with_pulse" != "no" ]] ; then
