@@ -442,7 +442,9 @@ static void OnRegistryGlobal( void *data, uint32_t id, uint32_t permissions,
             if( pwHostApi->metadata )
             {
                 spa_zero( pwHostApi->metadataListener );
-                pw_metadata_add_listener( pwHostApi->metadata, &pwHostApi->metadataListener,
+                /* The bound proxy IS the metadata interface. PipeWire >= 1.4 declares pw_metadata_add_listener
+                 * as a typed inline taking a struct pw_metadata *, and GCC 14 rejects the implicit conversion. */
+                pw_metadata_add_listener( (struct pw_metadata *)pwHostApi->metadata, &pwHostApi->metadataListener,
                                           &metadataEvents, pwHostApi );
             }
         }
